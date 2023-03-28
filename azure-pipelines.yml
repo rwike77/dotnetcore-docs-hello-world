@@ -1,0 +1,137 @@
+# ASP.NET Core (.NET Framework)
+# Build and test ASP.NET Core projects targeting the full .NET Framework.
+# Add steps that publish symbols, save build artifacts, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/dotnet-core
+variables: 
+- group: AzureResourcesVariableGroup
+
+trigger:
+- master
+stages:
+- stage: Build
+  jobs: 
+  - job: Build
+
+    pool:
+      vmImage: 'windows-latest'
+
+    variables:
+      solution: '**/*.sln'
+      buildPlatform: 'Any CPU'
+      buildConfiguration: 'Release'
+
+    steps:
+    - task: NuGetToolInstaller@1
+
+    - task: NuGetCommand@2
+      inputs:
+        restoreSolution: '$(solution)'
+
+    - task: VSBuild@1
+      inputs:
+        solution: '$(solution)'
+        msbuildArgs: '/p:DeployOnBuild=true /p:WebPublishMethod=Package /p:PackageAsSingleFile=true /p:SkipInvalidConfigurations=true /p:DesktopBuildPackageLocation="$(build.artifactStagingDirectory)\WebApp.zip" /p:DeployIisAppPath="Default Web Site"'
+        platform: '$(buildPlatform)'
+        configuration: '$(buildConfiguration)'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+
+- stage: DeployAzureResources
+  displayName: 'Deploy resources to Azure'
+  dependsOn: Build
+  condition: |
+    succeeded()    
+  jobs: 
+  - job: DeployAzureResources
+    pool: 
+      vmImage: 'windows-latest'
+    steps:
+      - task: AzureCLI@2
+        inputs:
+          azureSubscription: 'webapp-graphapi-on-behalf-pipeline'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            echo "variables--- $LOCATION  $RESOURCEGROUPNAME"
+            # Create a resource group
+            az group create --location $LOCATION --name $RESOURCEGROUPNAME
+            echo "Created resource group $RESOURCEGROUPNAME"    
+
+            # Create App Service plan
+            az appservice plan create -g $RESOURCEGROUPNAME -n $SVCPLANNAME --sku FREE
+            echo "Created App Service plan"
+            
+            ### Create Test resources
+            # create and configure an Azure App Service web app
+            az webapp create -g $RESOURCEGROUPNAME -p $SVCPLANNAME -n $WEBAPPNAMETEST
+            echo "Created App Service webapp $WEBAPPNAMETEST"
+            
+            ### Configure Azure App Service authentication
+            # Required resource access
+            cat > manifest.json << EOF
+            [
+                {
+                    "resourceAppId": "00000003-0000-0000-c000-000000000000",
+                    "resourceAccess": [
+                        {
+                            "id": "e1fe6dd8-ba31-4d61-89e7-88639da4683d",
+                            "type": "Scope"
+                        }
+                    ]
+                }
+            ]
+            EOF
+
+            # Create app registration for App Service authentication
+            redirectUriTest="https://$WEBAPPNAMETEST.azurewebsites.net/.auth/login/aad/callback"
+            homePageUrlTest="https://$WEBAPPNAMETEST.azurewebsites.net"
+            issuerTest="https://sts.windows.net/$TENANTID"
+            
+            appIdTest=$(az ad app create --display-name $WEBAPPNAMETEST --sign-in-audience AzureADMyOrg --enable-id-token-issuance true --query appId --output tsv)
+            echo "Registered app: $appIdTest"
+
+            # Set identifier URI, homepage, redirect URI, and resource access
+            az ad app update --id $appIdTest --identifier-uris api://$appIdTest --web-redirect-uris $redirectUriTest  --web-home-page-url $homePageUrlTest --required-resource-accesses @manifest.json
+            echo "Updated app"
+
+            # Get secret from the app for App Service authentication
+            secretTest=$(az ad app credential reset --id $appIdTest --query password --output tsv)
+            echo "Got secret"
+
+            az config set extension.use_dynamic_install=yes_without_prompt
+            az extension add --name authV2                      
+
+            # Configure settings on web app
+            az webapp config appsettings set --name $WEBAPPNAMETEST --resource-group $RESOURCEGROUPNAME --slot-settings MICROSOFT_PROVIDER_AUTHENTICATION_SECRET=$secretTest
+            echo "Set web app settings"
+
+            az webapp auth microsoft update --name $WEBAPPNAMETEST --resource-group $RESOURCEGROUPNAME --client-id $appIdTest --secret-setting MICROSOFT_PROVIDER_AUTHENTICATION_SECRET --allowed-audiences $redirectUriTest  --issuer $issuerTest
+            echo "Set App Service authentication settings"
+        name: DeploymentScript
+- stage: 'Test'
+  displayName: 'Deploy to the test environment'
+  dependsOn: DeployAzureResources
+  condition: |
+    succeeded()    
+  jobs: 
+  - job: Test
+    pool: 
+      vmImage: 'windows-latest'
+    steps:
+    - task: DownloadBuildArtifacts@0
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+    - task: AzureRmWebAppDeployment@4
+      inputs:
+        ConnectionType: 'AzureRM'
+        azureSubscription: 'webapp-graphapi-on-behalf-pipeline'
+        appType: 'webApp'
+        WebAppName: '$(WEBAPPNAMETEST)'
+        packageForLinux: '$(System.DefaultWorkingDirectory)/**/*.zip'
